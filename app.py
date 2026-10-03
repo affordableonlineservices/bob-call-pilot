@@ -219,6 +219,24 @@ def weekly():
 def health():
     return "ok", 200
 
+@app.get("/debug")
+def debug():
+    if request.args.get("token") != WEEKLY_TOKEN:
+        return "nope", 403
+    c = db()
+    events = c.execute(
+        "SELECT datetime(ts,'unixepoch'),kind,peer,note FROM events "
+        "ORDER BY id DESC LIMIT 20").fetchall()
+    msgs = c.execute(
+        "SELECT datetime(ts,'unixepoch'),peer,role,substr(body,1,160) "
+        "FROM messages ORDER BY id DESC LIMIT 20").fetchall()
+    c.close()
+    out = ["== events =="]
+    out += [f"{t} {k} {p} :: {n}" for t, k, p, n in events]
+    out += ["== messages =="]
+    out += [f"{t} {p} [{r}] {b}" for t, p, r, b in msgs]
+    return "\n".join(out), 200, {"Content-Type": "text/plain"}
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
