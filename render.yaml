@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: bob-call-pilot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_NUMBER
+        sync: false
+      - key: OWNER_CELL
+        value: +14806045005
+      - key: BUSINESS_NAME
+        value: BoB the Lobstar
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-20b
+      - key: SCHEDULING_LINK
+        sync: false
+      - key: REVIEW_LINK
+        sync: false
+      - key: WEEKLY_TOKEN
+        generateValue: true
