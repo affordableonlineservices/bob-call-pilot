@@ -219,6 +219,21 @@ def weekly():
 def health():
     return "ok", 200
 
+
+@app.get("/test_send")
+def test_send():
+    """Protected GET endpoint: sends a real test SMS to the owner and reports
+    exactly what Twilio says. Used to diagnose outbound SMS failures."""
+    if request.args.get("token") != WEEKLY_TOKEN:
+        return "nope", 403
+    try:
+        sid = send_sms(OWNER_CELL, f"{BUSINESS} pilot: outbound SMS test OK")
+        log("sms_out", OWNER_CELL, "test_send ok")
+        return f"sent sid={sid}", 200
+    except Exception as e:
+        log("sms_failed", OWNER_CELL, f"test_send: {e}"[:200])
+        return f"FAILED: {e}", 200
+      
 @app.get("/debug")
 def debug():
     if request.args.get("token") != WEEKLY_TOKEN:
