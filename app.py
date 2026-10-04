@@ -26,6 +26,12 @@ import requests
 from flask import Flask, request
 from twilio.twiml.voice_response import VoiceResponse
 from twilio.rest import Client
+try:
+    import libsql
+    _has_libsql = True
+except ImportError:
+    libsql = None
+    _has_libsql = False
 
 app = Flask(__name__)
 
@@ -44,7 +50,12 @@ DB = "/tmp/bob_pilot.db"  # NOTE: ephemeral on Render free tier; fine for the tr
 
 
 def db():
-    c = sqlite3.connect(DB)
+    """Durable storage: Turso (libSQL) when TURSO_URL is set, else local SQLite."""
+    turso_url = os.environ.get("TURSO_URL", "")
+    if turso_url and _has_libsql:
+        c = libsql.connect(turso_url, auth_token=os.environ.get("TURSO_AUTH_TOKEN", ""))
+    else:
+        c = sqlite3.connect(DB)
     c.execute(
         "CREATE TABLE IF NOT EXISTS events("
         "id INTEGER PRIMARY KEY, ts REAL, kind TEXT, peer TEXT, note TEXT)"
