@@ -9,6 +9,8 @@ Flow:
   4. Owner texts "SOLD <buyer-number>" from his own cell -> buyer gets a review request.
   5. Owner texts "BOOKED <caller-number>" -> logged as a booked job.
   6. GET /weekly?token=... -> Monday-morning SMS summary to the owner.
+  7. POST /track <- bobthelobstar.com visit tracker (JS beacon on every page).
+  8. GET /stats?token=... -> visit dashboard for the owner.
 
 Env vars (set on Render):
   TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_NUMBER (+1xxx, the Twilio number),
@@ -16,22 +18,23 @@ Env vars (set on Render):
   GROQ_MODEL (default openai/gpt-oss-20b),
   SCHEDULING_LINK (optional, e.g. Calendly — if empty the bot collects availability),
   REVIEW_LINK (optional Google review link),
-  WEEKLY_TOKEN (secret for the /weekly endpoint)
+  WEEKLY_TOKEN (secret for the /weekly and /stats endpoints)
+
+Note: the SQLite DB lives on Render's ephemeral filesystem (free tier), so
+visit history resets on restarts/redeploys. Weekly visit totals are preserved
+via the Monday SMS summary. For permanent history, wire up Turso/Postgres.
 """
+import hashlib
+import json as _json
 import os
 import sqlite3
 import time
+from urllib.parse import urlparse
 
 import requests
 from flask import Flask, request
 from twilio.twiml.voice_response import VoiceResponse
 from twilio.rest import Client
-try:
-    import libsql
-    _has_libsql = True
-except ImportError:
-    libsql = None
-    _has_libsql = False
 
 app = Flask(__name__)
 
@@ -48,14 +51,12 @@ WEEKLY_TOKEN = os.environ.get("WEEKLY_TOKEN", "change-me")
 
 DB = "/tmp/bob_pilot.db"  # NOTE: ephemeral on Render free tier; fine for the trial
 
+SITE_ORIGINS = {"https://bobthelobstar.com", "https://www.bobthelobstar.com"}
+BOT_HINTS = ("bot", "crawl", "spider", "slurp", "mediapartners", "ahrefs", "semrush")
+
 
 def db():
-    """Durable storage: Turso (libSQL) when TURSO_URL is set, else local SQLite."""
-    turso_url = os.environ.get("TURSO_URL", "")
-    if turso_url and _has_libsql:
-        c = libsql.connect(turso_url, auth_token=os.environ.get("TURSO_AUTH_TOKEN", ""))
-    else:
-        c = sqlite3.connect(DB)
+    c = sqlite3.connect(DB)
     c.execute(
         "CREATE TABLE IF NOT EXISTS events("
         "id INTEGER PRIMARY KEY, ts REAL, kind TEXT, peer TEXT, note TEXT)"
@@ -63,6 +64,11 @@ def db():
     c.execute(
         "CREATE TABLE IF NOT EXISTS messages("
         "id INTEGER PRIMARY KEY, ts REAL, peer TEXT, role TEXT, body TEXT)"
+    )
+    c.execute(
+        "CREATE TABLE IF NOT EXISTS visits("
+        "id INTEGER PRIMARY KEY, ts REAL, page TEXT, ref_domain TEXT, "
+        "ua TEXT, ip_hash TEXT)"
     )
     return c
 
@@ -130,17 +136,122 @@ def groq_reply(peer, user_msg):
     return r.json()["choices"][0]["message"]["content"].strip()
 
 
+def _cors_headers():
+    origin = request.headers.get("Origin", "")
+    if origin in SITE_ORIGINS:
+        return {"Access-Control-Allow-Origin": origin}
+    return {}
+
+@app.route("/track", methods=["OPTIONS"])
+def track_preflight():
+    h = _cors_headers()
+    h.update({
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Max-Age": "86400",
+    })
+    return "", 204, h
+
+@app.post("/track")
+def track():
+    try:
+        data = _json.loads(request.data or b"{}")
+    except Exception:
+        data = {}
+    ua = request.headers.get("User-Agent", "")
+    if any(h in ua.lower() for h in BOT_HINTS):
+        return "", 204, _cors_headers()
+    page = str(data.get("page", "") or "/")[:120]
+    if not page.startswith("/"):
+        page = "/" + page
+    ref = str(data.get("ref", "") or "")[:300]
+    ref_domain = ""
+    try:
+        ref_domain = urlparse(ref).netloc[:120]
+    except Exception:
+        pass
+    if ref_domain in ("bobthelobstar.com", "www.bobthelobstar.com"):
+        ref_domain = ""
+    ip = (request.headers.get("X-Forwarded-For", "") or
+          request.remote_addr or "").split(",")[0].strip()
+    ip_hash = hashlib.sha256(ip.encode()).hexdigest()[:16] if ip else ""
+    c = db()
+    c.execute(
+        "INSERT INTO visits(ts,page,ref_domain,ua,ip_hash) VALUES(?,?,?,?,?)",
+        (time.time(), page, ref_domain, ua[:200], ip_hash))
+    c.commit()
+    c.close()
+    return "", 204, _cors_headers()
+
+
+def _phx(ts):
+    return time.strftime("%m/%d %I:%M %p", time.gmtime(ts - 7 * 3600))
+
+@app.get("/stats")
+def stats():
+    if request.args.get("token") != WEEKLY_TOKEN:
+        return "nope", 403
+    now = time.time()
+    c = db()
+    total = c.execute("SELECT COUNT(*) FROM visits").fetchone()[0]
+    today = c.execute(
+        "SELECT COUNT(*) FROM visits WHERE ts>?", (now - 86400,)).fetchone()[0]
+    week = c.execute(
+        "SELECT COUNT(*) FROM visits WHERE ts>?", (now - 7 * 86400,)).fetchone()[0]
+    pages = c.execute(
+        "SELECT page, COUNT(*) n FROM visits GROUP BY page "
+        "ORDER BY n DESC LIMIT 20").fetchall()
+    refs = c.execute(
+        "SELECT ref_domain, COUNT(*) n FROM visits WHERE ref_domain<>'' "
+        "GROUP BY ref_domain ORDER BY n DESC LIMIT 20").fetchall()
+    recent = c.execute(
+        "SELECT ts, page, ref_domain FROM visits "
+        "ORDER BY id DESC LIMIT 50").fetchall()
+    c.close()
+
+    def rows(pairs):
+        return "".join(
+            f"<tr><td>{p}</td><td>{n}</td></tr>" for p, n in pairs) or \
+            "<tr><td colspan=2>No data yet</td></tr>"
+
+    recent_rows = "".join(
+        f"<tr><td>{_phx(ts)}</td><td>{page}</td><td>{rd or '-'}</td></tr>"
+        for ts, page, rd in recent) or \
+        "<tr><td colspan=3>No visits logged yet</td></tr>"
+
+    html = f"""<!doctype html><html><head><meta name="viewport"
+content="width=device-width,initial-scale=1"><title>BoB site stats</title>
+<style>body{{font-family:sans-serif;background:#0f1420;color:#e8ecf4;
+margin:0;padding:16px}}h1{{font-size:20px}}h2{{font-size:15px;color:#8fb4ff;
+margin-top:22px}}.cards{{display:flex;gap:10px}}.card{{background:#1a2338;
+border-radius:10px;padding:12px 16px;flex:1}}.card b{{font-size:24px;
+display:block}}table{{width:100%;border-collapse:collapse;font-size:13px;
+margin-top:6px}}td,th{{padding:6px 8px;border-bottom:1px solid #26314d;
+text-align:left}}th{{color:#8fb4ff}}.note{{color:#8a93a8;font-size:12px;
+margin-top:18px}}</style></head><body>
+<h1>bobthelobstar.com visits</h1>
+<div class="cards"><div class="card"><b>{total}</b>total</div>
+<div class="card"><b>{today}</b>last 24h</div>
+<div class="card"><b>{week}</b>last 7 days</div></div>
+<h2>Top pages</h2><table><tr><th>Page</th><th>Visits</th></tr>{rows(pages)}</table>
+<h2>Top referrers</h2><table><tr><th>Source</th><th>Visits</th></tr>{rows(refs)}</table>
+<h2>Recent visits (Phoenix time)</h2>
+<table><tr><th>When</th><th>Page</th><th>From</th></tr>{recent_rows}</table>
+<p class="note">Counts reset if the Render free tier restarts. Weekly totals are
+also texted to you every Monday morning.</p>
+</body></html>"""
+    return html, 200, {"Content-Type": "text/html"}
+
 @app.post("/voice")
 def voice():
-    """Inbound forwarded missed call: log it, fire the instant text-back, hang up."""
     caller = request.values.get("From", "")
     log("missed_call", caller, "forwarded no-answer")
-    textback = (f"Sorry we missed your call! This is {BUSINESS} \u2014 "
+    textback = (f"Sorry we missed your call! This is {BUSINESS} "
                 "are you looking for a quote, or is something urgent?")
     try:
         send_sms(caller, textback)
         log("sms_out", caller, textback[:80])
-    except Exception as e:  # trial accounts can only text verified numbers
+    except Exception as e:
         log("sms_failed", caller, str(e)[:120])
     resp = VoiceResponse()
     resp.say("Sorry we missed your call. We're sending you a text right now.",
@@ -148,15 +259,12 @@ def voice():
     resp.hangup()
     return str(resp), 200, {"Content-Type": "text/xml"}
 
-
 @app.post("/sms")
 def sms():
     frm = request.values.get("From", "")
     body = request.values.get("Body", "").strip()
     log("sms_in", frm, body[:120])
-    save_msg(frm, "user", body)
-
-    # --- owner commands from his own cell ---
+    save_msg(frm, body)
     if frm == OWNER_CELL:
         upper = body.upper()
         if upper.startswith("SOLD"):
@@ -164,7 +272,7 @@ def sms():
             if len(parts) >= 2:
                 buyer = parts[1]
                 review_txt = (
-                    f"Hi! Thanks for your purchase with {BUSINESS} \U0001f649 "
+                    f"Hi! Thanks for your purchase with {BUSINESS} "
                     "If everything went well, a quick review would mean a lot."
                     + (f" {REVIEW_LINK}" if REVIEW_LINK else
                        " Just reply here and let us know!")
@@ -172,7 +280,7 @@ def sms():
                 try:
                     send_sms(buyer, review_txt)
                     log("review_sent", buyer, "")
-                    save_msg(frm, "assistant", f"Review request sent to {buyer}.")
+                    save_msg(frm, f"Review request sent to {buyer}.")
                 except Exception as e:
                     log("sms_failed", buyer, str(e)[:120])
                 return "", 200
@@ -181,15 +289,13 @@ def sms():
             peer = parts[1] if len(parts) >= 2 else ""
             log("booking", peer, "marked by owner")
             return "", 200
-
-    # --- normal conversation ---
     try:
         reply = groq_reply(frm, body)
     except Exception as e:
         log("groq_failed", frm, str(e)[:120])
         reply = (f"Thanks for reaching out to {BUSINESS}! "
                  "The owner will follow up with you shortly.")
-    save_msg(frm, "assistant", reply)
+    save_msg(frm, reply)
     try:
         send_sms(frm, reply)
         log("sms_out", frm, reply[:80])
@@ -197,10 +303,8 @@ def sms():
         log("sms_failed", frm, str(e)[:120])
     return "", 200
 
-
 @app.get("/weekly")
 def weekly():
-    """Protected endpoint; hit it from a Monday-morning cron."""
     if request.args.get("token") != WEEKLY_TOKEN:
         return "nope", 403
     week_ago = time.time() - 7 * 86400
@@ -214,10 +318,17 @@ def weekly():
         "SELECT COUNT(DISTINCT peer) FROM messages WHERE ts>?", (week_ago,)).fetchone()[0]
     booked = count("booking")
     reviews = count("review_sent")
+    visits_week = c.execute(
+        "SELECT COUNT(*) FROM visits WHERE ts>?", (week_ago,)).fetchone()[0]
+    top = c.execute(
+        "SELECT page, COUNT(*) n FROM visits WHERE ts>? "
+        "GROUP BY page ORDER BY n DESC LIMIT 1", (week_ago,)).fetchone()
     c.close()
     summary = (f"{BUSINESS} weekly: {missed} missed calls caught, "
                f"{convos} text conversations, {booked} bookings marked, "
-               f"{reviews} review requests sent.")
+               f"{reviews} review requests sent. "
+               f"Site: {visits_week} visits"
+               + (f" (top: {top[0]} x{top[1]})" if top else "") + ".")
     try:
         send_sms(OWNER_CELL, summary)
         log("weekly_sent", OWNER_CELL, summary)
@@ -225,43 +336,9 @@ def weekly():
         log("sms_failed", OWNER_CELL, str(e)[:120])
     return "ok", 200
 
-
 @app.get("/health")
 def health():
     return "ok", 200
-
-
-@app.get("/test_send")
-def test_send():
-    """Protected GET endpoint: sends a real test SMS to the owner and reports
-    exactly what Twilio says. Used to diagnose outbound SMS failures."""
-    if request.args.get("token") != WEEKLY_TOKEN:
-        return "nope", 403
-    try:
-        sid = send_sms(OWNER_CELL, f"{BUSINESS} pilot: outbound SMS test OK")
-        log("sms_out", OWNER_CELL, "test_send ok")
-        return f"sent sid={sid}", 200
-    except Exception as e:
-        log("sms_failed", OWNER_CELL, f"test_send: {e}"[:200])
-        return f"FAILED: {e}", 200
-      
-@app.get("/debug")
-def debug():
-    if request.args.get("token") != WEEKLY_TOKEN:
-        return "nope", 403
-    c = db()
-    events = c.execute(
-        "SELECT datetime(ts,'unixepoch'),kind,peer,note FROM events "
-        "ORDER BY id DESC LIMIT 20").fetchall()
-    msgs = c.execute(
-        "SELECT datetime(ts,'unixepoch'),peer,role,substr(body,1,160) "
-        "FROM messages ORDER BY id DESC LIMIT 20").fetchall()
-    c.close()
-    out = ["== events =="]
-    out += [f"{t} {k} {p} :: {n}" for t, k, p, n in events]
-    out += ["== messages =="]
-    out += [f"{t} {p} [{r}] {b}" for t, p, r, b in msgs]
-    return "\n".join(out), 200, {"Content-Type": "text/plain"}
 
 
 if __name__ == "__main__":
