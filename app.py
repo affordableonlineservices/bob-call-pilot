@@ -219,6 +219,10 @@ def stats():
         "SELECT COUNT(*) FROM visits WHERE ts>?", (now - 86400,)).fetchone()[0]
     week = c.execute(
         "SELECT COUNT(*) FROM visits WHERE ts>?", (now - 7 * 86400,)).fetchone()[0]
+    qr_total, qr_last = c.execute(
+        "SELECT COUNT(*), MAX(ts) FROM visits WHERE page LIKE '/r/%'").fetchone()
+    qr_sub = ("Last scan: " + _phx(qr_last)) if qr_last else "No scans yet"
+
     pages = c.execute(
         "SELECT page, COUNT(*) n FROM visits GROUP BY page "
         "ORDER BY n DESC LIMIT 20").fetchall()
@@ -253,7 +257,8 @@ margin-top:18px}}</style></head><body>
 <h1>bobthelobstar.com visits</h1>
 <div class="cards"><div class="card"><b>{total}</b>total</div>
 <div class="card"><b>{today}</b>last 24h</div>
-<div class="card"><b>{week}</b>last 7 days</div></div>
+<div class="card"><b>{week}</b>last 7 days</div>
+<div class="card"><b>{qr_total}</b>QR scans<br><span style="font-size:11px;color:#8a93a8">{qr_sub}</span></div></div>
 <h2>Top pages</h2><table><tr><th>Page</th><th>Visits</th></tr>{rows(pages)}</table>
 <h2>Top referrers</h2><table><tr><th>Source</th><th>Visits</th></tr>{rows(refs)}</table>
 <h2>Recent visits (Phoenix time)</h2>
