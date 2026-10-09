@@ -11,6 +11,7 @@ Flow:
   6. GET /weekly?token=... -> Monday-morning SMS summary to the owner.
   7. POST /track <- bobthelobstar.com visit tracker (JS beacon on every page).
   8. GET /stats?token=... -> visit dashboard for the owner.
+  9. GET /r/<slug> -> logs a trackable visit (QR codes), redirects to the site.
 
 Env vars (set on Render):
   TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_NUMBER (+1xxx, the Twilio number),
@@ -32,7 +33,7 @@ import time
 from urllib.parse import urlparse
 
 import requests
-from flask import Flask, request
+from flask import Flask, redirect, request
 from twilio.twiml.voice_response import VoiceResponse
 from twilio.rest import Client
 
@@ -183,6 +184,26 @@ def track():
     c.close()
     return "", 204, _cors_headers()
 
+
+@app.get("/r/<slug>")
+def qr_redirect(slug):
+    """Trackable short link (e.g. QR on the business card): logs the visit,
+    then sends the visitor to the site."""
+    ok = bool(slug) and len(slug) <= 32 and slug.replace("-", "").replace("_", "").isalnum()
+    if not ok:
+        return "nope", 404
+    ua = request.headers.get("User-Agent", "")
+    if not any(h in ua.lower() for h in BOT_HINTS):
+        ip = (request.headers.get("X-Forwarded-For", "") or
+              request.remote_addr or "").split(",")[0].strip()
+        ip_hash = hashlib.sha256(ip.encode()).hexdigest()[:16] if ip else ""
+        c = db()
+        c.execute(
+            "INSERT INTO visits(ts,page,ref_domain,ua,ip_hash) VALUES(?,?,?,?,?)",
+            (time.time(), f"/r/{slug}", "qr", ua[:200], ip_hash))
+        c.commit()
+        c.close()
+    return redirect("https://bobthelobstar.com/", code=302)
 
 def _phx(ts):
     return time.strftime("%m/%d %I:%M %p", time.gmtime(ts - 7 * 3600))
